@@ -32,7 +32,8 @@ use compact_jwt::traits::JwsSignable;
 use compact_jwt::Jws;
 #[cfg(feature = "broker")]
 use kanidm_hsm_crypto::{
-    BoxedDynTpm, IdentityKey, KeyAlgorithm, LoadableIdentityKey, MachineKey, SealedData, Tpm,
+    BoxedDynTpm, IdentityKey, KeyAlgorithm, LoadableIdentityKey, MachineKey, PinValue, SealedData,
+    Tpm,
 };
 #[cfg(feature = "broker")]
 use kanidm_hsm_crypto::{LoadableMsOapxbcRsaKey, MsOapxbcRsaKey};
@@ -1904,7 +1905,7 @@ impl BrokerClientApplication {
     ) -> Result<IdentityKey, MsalError> {
         match &self.cert_key {
             Some(cert_key) => {
-                let cert_key = tpm.identity_key_load(machine_key, cert_key)
+                let cert_key = tpm.identity_key_load(machine_key, None, cert_key)
             .map_err(|e| {
                 MsalError::TPMFail(format!("Failed to load IdentityKey: {:?}", e))
             })?;
@@ -1956,7 +1957,7 @@ impl BrokerClientApplication {
             .await?;
         // Create the transport and cert keys
         let loadable_cert_key = tpm
-            .identity_key_create(machine_key, KeyAlgorithm::Rsa2048)
+            .identity_key_create(machine_key, None, KeyAlgorithm::Rsa2048)
             .map_err(|e| MsalError::TPMFail(format!("Failed creating certificate key: {:?}", e)))?;
         let loadable_transport_key = tpm
             .msoapxbc_rsa_key_create(machine_key)
@@ -1966,6 +1967,7 @@ impl BrokerClientApplication {
         // Create the CSR
         let csr_der = match tpm.identity_key_certificate_request(
             machine_key,
+            None,
             &loadable_cert_key,
             "7E980AD9-B86D-4306-9425-9AC066FB014A",
         ) {
@@ -2009,6 +2011,7 @@ impl BrokerClientApplication {
 
         let new_loadable_cert_key = match tpm.identity_key_associate_certificate(
             machine_key,
+            None,
             &loadable_cert_key,
             &cert
                 .to_der()
@@ -2801,12 +2804,11 @@ impl BrokerClientApplication {
     ///   acquire_token_by_username_password_for_device_enrollment
     ///   or acquire_token_by_device_flow.
     ///
-    /// * `key` - An optional existing LoadableIdentityKey, if not provided
-    ///   one will be created.
-    ///
     /// * `tpm` - The tpm object.
     ///
     /// * `machine_key` - The TPM MachineKey associated with this application.
+    ///
+    /// * `pin` - The PIN code which will be used to unlock the key.
     ///
     /// # Returns
     /// * Success: Either the existing LoadableIdentityKey, or a new created
@@ -2815,10 +2817,13 @@ impl BrokerClientApplication {
     pub async fn provision_hello_for_business_key(
         &self,
         token: &UserToken,
-        key: Option<LoadableIdentityKey>,
         tpm: &mut BoxedDynTpm,
         machine_key: &MachineKey,
+        pin: &str,
     ) -> Result<LoadableIdentityKey, MsalError> {
+        let pin = PinValue::new(pin)
+            .map_err(|e| MsalError::TPMFail(format!("Failed setting pin value: {:?}", e)))?;
+
         // Discover the KeyProvisioningService
         let access_token = match &token.access_token {
             Some(access_token) => access_token.clone(),
@@ -2864,17 +2869,14 @@ impl BrokerClientApplication {
             )
             .await?;
 
-        // Use an existing key, or create a new hello key (using the TPM)
-        let loadable_win_hello_key = match key {
-            Some(loadable_win_hello_key) => loadable_win_hello_key,
-            None => tpm
-                .identity_key_create(machine_key, KeyAlgorithm::Rsa2048)
-                .map_err(|e| {
-                    MsalError::TPMFail(format!("Failed creating Windows Hello Key: {:?}", e))
-                })?,
-        };
+        // Create a new hello key (using the TPM)
+        let loadable_win_hello_key = tpm
+            .identity_key_create(machine_key, Some(&pin), KeyAlgorithm::Rsa2048)
+            .map_err(|e| {
+                MsalError::TPMFail(format!("Failed creating Windows Hello Key: {:?}", e))
+            })?;
         let win_hello_key = tpm
-            .identity_key_load(machine_key, &loadable_win_hello_key)
+            .identity_key_load(machine_key, Some(&pin), &loadable_win_hello_key)
             .map_err(|e| {
                 MsalError::TPMFail(format!("Failed loading Windows Hello Key: {:?}", e))
             })?;
@@ -2946,6 +2948,8 @@ impl BrokerClientApplication {
     ///
     /// * `machine_key` - The TPM MachineKey associated with this application.
     ///
+    /// * `pin` - The PIN code required to unlock the key.
+    ///
     /// # Returns
     /// * Success: A UserToken containing an access_token.
     /// * Failure: An MsalError, indicating the failure.
@@ -2956,9 +2960,19 @@ impl BrokerClientApplication {
         scopes: Vec<&str>,
         tpm: &mut BoxedDynTpm,
         machine_key: &MachineKey,
+        pin: &str,
     ) -> Result<UserToken, MsalError> {
+        let pin = PinValue::new(pin)
+            .map_err(|e| MsalError::TPMFail(format!("Failed setting pin value: {:?}", e)))?;
+
         let prt = self
-            .acquire_user_prt_by_hello_for_business_key_internal(username, key, tpm, machine_key)
+            .acquire_user_prt_by_hello_for_business_key_internal(
+                username,
+                key,
+                tpm,
+                machine_key,
+                &pin,
+            )
             .await?;
         let transport_key = self.transport_key(tpm, machine_key)?;
         let session_key = prt.session_key()?;
@@ -2984,10 +2998,11 @@ impl BrokerClientApplication {
         loadable_key: &LoadableIdentityKey,
         tpm: &mut BoxedDynTpm,
         machine_key: &MachineKey,
+        pin: &PinValue,
     ) -> Result<Jws, MsalError> {
         let nonce = self.request_nonce().await?;
         let key = tpm
-            .identity_key_load(machine_key, loadable_key)
+            .identity_key_load(machine_key, Some(pin), loadable_key)
             .map_err(|e| MsalError::TPMFail(format!("{:?}", e)))?;
         let win_hello_pub_der = tpm.identity_key_public_as_der(&key).map_err(|e| {
             MsalError::TPMFail(format!("Failed getting Windows Hello Key as der: {:?}", e))
@@ -3056,9 +3071,10 @@ impl BrokerClientApplication {
         key: &LoadableIdentityKey,
         tpm: &mut BoxedDynTpm,
         machine_key: &MachineKey,
+        pin: &PinValue,
     ) -> Result<PrimaryRefreshToken, MsalError> {
         let jwt = self
-            .build_jwt_by_hello_for_business_key(username, key, tpm, machine_key)
+            .build_jwt_by_hello_for_business_key(username, key, tpm, machine_key, pin)
             .await?;
         let signed_jwt = self.sign_jwt(&jwt, tpm, machine_key).await?;
 
@@ -3078,6 +3094,8 @@ impl BrokerClientApplication {
     ///
     /// * `machine_key` - The TPM MachineKey associated with this application.
     ///
+    /// * `pin` - The PIN code required to unlock the key.
+    ///
     /// # Returns
     /// * Success: An encrypted PrimaryRefreshToken, containing a refresh_token and tgt.
     /// * Failure: An MsalError, indicating the failure.
@@ -3087,9 +3105,19 @@ impl BrokerClientApplication {
         key: &LoadableIdentityKey,
         tpm: &mut BoxedDynTpm,
         machine_key: &MachineKey,
+        pin: &str,
     ) -> Result<SealedData, MsalError> {
+        let pin = PinValue::new(pin)
+            .map_err(|e| MsalError::TPMFail(format!("Failed setting pin value: {:?}", e)))?;
+
         let prt = self
-            .acquire_user_prt_by_hello_for_business_key_internal(username, key, tpm, machine_key)
+            .acquire_user_prt_by_hello_for_business_key_internal(
+                username,
+                key,
+                tpm,
+                machine_key,
+                &pin,
+            )
             .await?;
         let transport_key = self.transport_key(tpm, machine_key)?;
         self.seal_user_prt(&prt, tpm, &transport_key)
