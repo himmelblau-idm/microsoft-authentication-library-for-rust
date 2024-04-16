@@ -187,7 +187,7 @@ struct CredType {
     if_exists_result: u8,
 }
 
-#[derive(Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct IdToken {
     pub name: String,
     pub oid: String,
@@ -264,7 +264,7 @@ impl FromStr for IdToken {
     }
 }
 
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ClientInfo {
     pub uid: Option<Uuid>,
     pub utid: Option<Uuid>,
@@ -319,7 +319,7 @@ where
     }
 }
 
-#[derive(Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug, Clone, Deserialize, Zeroize, ZeroizeOnDrop)]
 pub struct UserToken {
     pub token_type: String,
     pub scope: Option<String>,
@@ -630,7 +630,7 @@ impl FromStr for TGT {
 }
 
 #[cfg(feature = "broker")]
-#[derive(Default, Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
 pub struct TGT {
     #[serde(rename = "clientKey")]
     pub client_key: Option<String>,
@@ -649,7 +649,7 @@ pub struct TGT {
 }
 
 #[cfg(feature = "broker")]
-#[derive(Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
+#[derive(Debug, Clone, Deserialize, Serialize, Zeroize, ZeroizeOnDrop)]
 #[allow(dead_code)]
 struct PrimaryRefreshToken {
     token_type: String,
@@ -3121,6 +3121,17 @@ impl BrokerClientApplication {
             .await?;
         let transport_key = self.transport_key(tpm, machine_key)?;
         self.seal_user_prt(&prt, tpm, &transport_key)
+    }
+
+    pub async fn extract_tgts_from_prt(
+        &self,
+        sealed_prt: &SealedData,
+        tpm: &mut BoxedDynTpm,
+        machine_key: &MachineKey,
+    ) -> Result<(TGT, TGT), MsalError> {
+        let transport_key = self.transport_key(tpm, machine_key)?;
+        let prt = self.unseal_user_prt(sealed_prt, tpm, &transport_key)?;
+        Ok((prt.tgt_ad.clone(), prt.tgt_cloud.clone()))
     }
 
     fn seal_user_prt(
